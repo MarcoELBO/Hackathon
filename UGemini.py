@@ -1,80 +1,123 @@
+import os
 import asyncio
-import threading
 import logging
-from pymongo import MongoClient
-from pymongo.errors import PyMongoError
+from dotenv import load_dotenv
+from google import genai
 from telegram import Bot
+from telegram.error import BadRequest
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
 
-# Configuración de logging
+# Cargar variables de entorno desde el archivo .env
+load_dotenv()
+
+# Configurar logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Variables de entorno y configuración (usando dotenv o similares)
-MONGO_URI = "tu_mongo_uri"
-DATABASE_NAME = "Transporte"
-COLLECTION_NAME = "Autobuses"
-TELEGRAM_TOKEN = "tu_telegram_token"
+# Obtener las variables de entorno
+MONGO_URI = os.getenv("MONGO_URI")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "Transporte")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "Autobuses")
 
-# Conexión a la base de datos
-client = MongoClient(MONGO_URI)
-db = client[DATABASE_NAME]
-collection = db[COLLECTION_NAME]
-
-# Inicializa el bot de Telegram
-bot = Bot(token=TELEGRAM_TOKEN)
+# Configurar parámetros de alerta
+TIEMPO = "7 minutos"
+VELOCIDAD = "6 km/h"
 
 
-async def enviar_alerta(chat_id: int, mensaje: str):
+def get_database_collection(uri: str, db_name: str, collection_name: str):
     try:
-        await bot.send_message(chat_id=chat_id, text=mensaje)
-        logger.info("Mensaje enviado a %s", chat_id)
+        client = MongoClient(uri)
+        client.admin.command('ping')
+        db = client[db_name]
+        collection = db[collection_name]
+        return collection
+    except ConnectionFailure as e:
+        logger.error("No se pudo conectar a la base de datos: %s", e)
+        raise
+
+
+def obtener_chat_ids(collection):
+    chat_ids = []
+    try:
+        for auto in collection.find({"Corregir": 1}):
+            chat_id = auto.get('IdAutobus')
+            if chat_id:
+                chat_ids.append(chat_id)
+        logger.info("Chat IDs obtenidos: %s", chat_ids)
     except Exception as e:
-        logger.error("Error al enviar mensaje a %s: %s", chat_id, e)
+        logger.error("Error al obtener chat IDs: %s", e)
+    return chat_ids
 
 
-def procesar_evento(change):
-    """
-    Función para procesar el evento de cambio.
-    Aquí puedes agregar la lógica para generar el mensaje o actualizar tu aplicación.
-    """
-    logger.info("Cambio detectado: %s", change)
-    # Por ejemplo, si detectamos un cambio que requiere enviar alerta:
-    chat_id = change.get("fullDocument", {}).get("IdAutobus")
-    if chat_id:
-        # Genera o usa tu lógica para el mensaje
-        mensaje = "Alerta: Se ha detectado un cambio en tu ruta."
-        # Ejecutamos la función asíncrona en el loop principal:
-        asyncio.run(enviar_alerta(chat_id, mensaje))
-
-
-def monitorear_cambios():
-    """
-    Esta función se encarga de abrir el Change Stream y estar pendiente de cambios en la colección.
-    Se ejecuta en un hilo separado.
-    """
+def generar_mensaje(client_api, tiempo: str, velocidad: str) -> str:
+    prompt = (
+        f"Considerate un supervisor de rutas de autobuses. Debes dar mensajes claros y cortos, "
+        f"enviando alertas solo si el conductor se ha desfasado de su horario y transcurso de ruta. "
+        f"Toma en cuenta el tiempo = {tiempo} y la velocidad = {velocidad}. "
+        f"El conductor debe mantener esta velocidad durante el tiempo dado. "
+        f"Envíame solo un mensaje de alerta indicando la velocidad a la que debe ir."
+    )
     try:
-        with collection.watch() as change_stream:
-            for change in change_stream:
-                procesar_evento(change)
-    except PyMongoError as e:
-        logger.error("Error en el Change Stream: %s", e)
+        response = client_api.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[prompt],
+        )
+        mensaje = response.text.strip() if hasattr(response, "text") else ""
+        if not mensaje:
+            logger.warning("El mensaje generado está vacío.")
+        return mensaje
+    except Exception as e:
+        logger.error("Error al generar el mensaje: %s", e)
+        return ""
 
 
-def iniciar_monitoreo():
-    # Ejecutar el monitoreo en un hilo separado para no bloquear el loop principal
-    hilo = threading.Thread(target=monitorear_cambios, daemon=True)
-    hilo.start()
-    logger.info(
-        "Monitoreo de cambios iniciado en la colección '%s'", COLLECTION_NAME)
+async def enviar_mensajes(bot: Bot, chat_ids: list, mensaje: str):
+    if not mensaje:
+        logger.error("No se envió mensaje: el mensaje está vacío.")
+        return
+    for chat_id in chat_ids:
+        try:
+            await bot.send_message(chat_id=chat_id, text=mensaje)
+            logger.info("Mensaje enviado correctamente a %s", chat_id)
+            # Actualizar el campo "Corregir" en la colección para el chat_id correspondiente
+            try:
+                coleccion = get_database_collection(
+                    MONGO_URI, DATABASE_NAME, COLLECTION_NAME)
+                coleccion.update_one(
+                    {"IdAutobus": chat_id},
+                    {"$set": {"Corregir": 0}}
+                )
+                logger.info(
+                    "Campo 'Corregir' actualizado a 1 para el chat_id: %s", chat_id)
+            except Exception as e:
+                logger.error(
+                    "Error al actualizar el campo 'Corregir' para el chat_id %s: %s", chat_id, e)
+        except BadRequest as e:
+            logger.error("Error al enviar mensaje a %s: %s", chat_id, e)
+        except Exception as e:
+            logger.error(
+                "Error inesperado al enviar mensaje a %s: %s", chat_id, e)
 
+
+async def main():
+    coleccion = get_database_collection(
+        MONGO_URI, DATABASE_NAME, COLLECTION_NAME)
+    chat_ids = obtener_chat_ids(coleccion)
+
+    if not chat_ids:
+        logger.info("No se encontraron chat IDs para enviar mensajes.")
+        return
+
+    client_api = genai.Client(api_key=GOOGLE_API_KEY)
+    mensaje = generar_mensaje(client_api, TIEMPO, VELOCIDAD)
+
+    bot = Bot(token=TELEGRAM_TOKEN)
+    await enviar_mensajes(bot, chat_ids, mensaje)
 
 if __name__ == "__main__":
-    iniciar_monitoreo()
-
-    # Mantener el proceso corriendo. Por ejemplo, con un loop infinito.
-    try:
-        while True:
-            # Aquí puedes incluir otras tareas o simplemente dormir
-            asyncio.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("Deteniendo el monitoreo.")
+    while True:
+        asyncio.run(main())
+        asyncio.sleep(20)
