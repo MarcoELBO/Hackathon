@@ -27,22 +27,22 @@ TIEMPO = "7 minutos"
 VELOCIDAD = "6 km/h"
 
 
-def get_database_collection(uri: str, db_name: str, collection_name: str):
+def get_database_collection(uri: str, db_name: str, coleccion_name: str):
     try:
         client = MongoClient(uri)
         client.admin.command('ping')
         db = client[db_name]
-        collection = db[collection_name]
-        return collection
+        coleccion = db[coleccion_name]
+        return coleccion
     except ConnectionFailure as e:
         logger.error("No se pudo conectar a la base de datos: %s", e)
         raise
 
 
-def obtener_chat_ids(collection):
+def obtener_chat_ids(coleccion):
     chat_ids = []
     try:
-        for auto in collection.find({"Corregir": 1}):
+        for auto in coleccion.find({"Corregir": 1}):
             chat_id = auto.get('IdAutobus')
             if chat_id:
                 chat_ids.append(chat_id)
